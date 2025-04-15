@@ -40,6 +40,13 @@ namespace leveldb {
 
 namespace {
 
+static char time_buf[30];
+static time_t rawtime;
+static struct tm * timeinfo;
+static int count_newfile = 0;
+static int count_rndfile = 0;
+static int count_rm_file = 0;
+
 // Set by EnvPosixTestHelper::SetReadOnlyMMapLimit() and MaxOpenFiles().
 int g_open_read_only_file_limit = -1;
 
@@ -527,6 +534,11 @@ class PosixEnv : public Env {
 
   Status NewSequentialFile(const std::string& filename,
                            SequentialFile** result) override {
+    time ( &rawtime );
+    timeinfo = localtime ( &rawtime );
+    strftime(time_buf, 30, "%x %X", timeinfo);
+    fprintf(stdout, "[log %s] SEQ access [%s] file number\n", time_buf, filename.c_str());
+
     int fd = ::open(filename.c_str(), O_RDONLY | kOpenBaseFlags);
     if (fd < 0) {
       *result = nullptr;
@@ -539,6 +551,12 @@ class PosixEnv : public Env {
 
   Status NewRandomAccessFile(const std::string& filename,
                              RandomAccessFile** result) override {
+    time ( &rawtime );
+    timeinfo = localtime ( &rawtime );
+    strftime(time_buf, 30, "%x %X", timeinfo);
+    count_rndfile++;
+    fprintf(stdout, "[log %s] RANDOM access [%s] file number %d\n", time_buf, filename.c_str(),  count_rndfile);
+
     *result = nullptr;
     int fd = ::open(filename.c_str(), O_RDONLY | kOpenBaseFlags);
     if (fd < 0) {
@@ -570,10 +588,124 @@ class PosixEnv : public Env {
     return status;
   }
 
-  Status NewWritableFile(const std::string& filename,
-                         WritableFile** result) override {
-    int fd = ::open(filename.c_str(),
-                    O_TRUNC | O_WRONLY | O_CREAT | kOpenBaseFlags, 0644);
+  Status NewWritableFile(const std::string& filename, WritableFile** result) override {
+    int fd;
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+    strftime(time_buf, 30, "%x %X", timeinfo);
+    count_newfile++;
+    
+    // Check if file is a .ldb file
+    if (filename.size() < 3 || filename.substr(filename.size() - 3) != "ldb") {
+      // Regular file handling - no changes needed
+      fd = open(filename.c_str(), O_TRUNC | O_WRONLY | O_CREAT, 0644);
+      fprintf(stdout, "[log %s] new file [%s] number %d\n", time_buf, filename.c_str(), count_newfile);
+    } else {
+      // Handle .ldb files with safer string operations
+      size_t split_level = filename.find("START");
+      size_t split_level2 = filename.find("END");
+      
+      // Make sure both markers exist to avoid buffer overflow
+      if (split_level == std::string::npos || split_level2 == std::string::npos || 
+          split_level >= split_level2 || 
+          split_level + 5 >= filename.size()) {
+        // Invalid format - fallback to standard file handling
+        fd = open(filename.c_str(), O_TRUNC | O_WRONLY | O_CREAT, 0644);
+        fprintf(stdout, "[log %s] new file [%s] (invalid format) number %d\n", 
+                time_buf, filename.c_str(), count_newfile);
+      } else {
+        // Extract level safely
+        std::string level_str;
+        if (split_level + 5 < split_level2) {
+          level_str = filename.substr(split_level + 5, split_level2 - (split_level + 5));
+        } else {
+          level_str = "0"; // Default to level 0 if extraction fails
+        }
+        
+        // Safe conversion to int without exceptions
+        int level_num = 0;
+        char* end_ptr = nullptr;
+        long level_val = strtol(level_str.c_str(), &end_ptr, 10);
+        if (end_ptr != level_str.c_str() && *end_ptr == '\0' && 
+            level_val >= 0 && level_val <= 2147483647) {
+          level_num = static_cast<int>(level_val);
+        }
+        
+        // Safely construct the target filename
+        std::string fname_tmp;
+        if (split_level < filename.size() && split_level2 + 3 < filename.size()) {
+          fname_tmp = filename.substr(0, split_level);
+          if (split_level2 + 3 < filename.size()) {
+            fname_tmp += filename.substr(split_level2 + 3);
+          }
+        } else {
+          // Fallback if indices are invalid
+          fname_tmp = filename;
+        }
+        
+        fprintf(stdout, "[log %s] new file [%s] level_num %d\n", time_buf, fname_tmp.c_str(), level_num);
+        
+        // Find the directory path safely
+        size_t split_index = fname_tmp.find_last_of('/');
+        if (split_index == std::string::npos) {
+          split_index = 0; // No directory separator found
+        }
+        
+        // Determine directory name based on level
+        std::string level_dir = "/level_" + std::to_string(level_num);
+        
+        // Get base directory and ensure level directory exists
+        std::string base_dir = "";
+        if (split_index > 0) {
+          base_dir = fname_tmp.substr(0, split_index);
+        }
+        
+        std::string level_dir_path = base_dir + level_dir;
+        
+        // Create level directory if it doesn't exist
+        struct stat st;
+        if (stat(level_dir_path.c_str(), &st) != 0) {
+          // Directory doesn't exist, create it
+          if (mkdir(level_dir_path.c_str(), 0755) != 0 && errno != EEXIST) {
+            fprintf(stdout, "[log %s] failed to create directory [%s]: %s\n", 
+                   time_buf, level_dir_path.c_str(), strerror(errno));
+            return PosixError(level_dir_path, errno);
+          }
+          fprintf(stdout, "[log %s] created directory [%s]\n", time_buf, level_dir_path.c_str());
+        }
+        
+        // Construct full destination path safely
+        std::string actual_fname;
+        if (split_index > 0) {
+          std::string base_name = fname_tmp.substr(split_index + 1);
+          actual_fname = level_dir_path + "/" + base_name;
+        } else {
+          actual_fname = level_dir_path + "/" + fname_tmp;
+        }
+        
+        // Create target file first
+        int tmp_fd = open(actual_fname.c_str(), O_TRUNC | O_WRONLY | O_CREAT, 0644);
+        if (tmp_fd < 0) {
+          return PosixError(actual_fname, errno);
+        }
+        close(tmp_fd);
+        
+        // Create symlink safely
+        if (unlink(fname_tmp.c_str()) != 0 && errno != ENOENT) {
+          return PosixError(fname_tmp, errno);
+        }
+        
+        if (symlink(actual_fname.c_str(), fname_tmp.c_str()) != 0) {
+          return PosixError(fname_tmp, errno);
+        }
+        
+        fd = open(fname_tmp.c_str(), O_WRONLY, 0644);
+        fprintf(stdout, "[log %s] new file (filename=%s)[%s]-->[%s] (level-%d) number %d\n", 
+                time_buf, filename.c_str(), fname_tmp.c_str(), actual_fname.c_str(), 
+                level_num, count_newfile);
+      }
+    }
+    
     if (fd < 0) {
       *result = nullptr;
       return PosixError(filename, errno);
@@ -616,9 +748,50 @@ class PosixEnv : public Env {
   }
 
   Status RemoveFile(const std::string& filename) override {
-    if (::unlink(filename.c_str()) != 0) {
-      return PosixError(filename, errno);
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+    strftime(time_buf, 30, "%x %X", timeinfo);
+    count_rm_file++;
+    
+    // Check if file is a .ldb file
+    if (filename.size() < 3 || filename.substr(filename.size() - 3) != "ldb") {
+      // Regular file handling - no changes needed
+      fprintf(stdout, "[log %s] remove [%s] file number %d\n", time_buf, filename.c_str(), count_rm_file);
+      if (unlink(filename.c_str()) != 0) {
+        return PosixError(filename, errno);
+      }
+    } else {
+      // For .ldb files, safely handle symlink removal
+      char real_name[PATH_MAX]; // Use PATH_MAX for safety
+      
+      // Initialize to empty string for safety
+      real_name[0] = '\0';
+      
+      // Get the real path safely
+      if (realpath(filename.c_str(), real_name) == nullptr) {
+        // If realpath fails, just try to remove the original file
+        fprintf(stdout, "[log %s] remove [%s] (realpath failed) file number %d\n", 
+                time_buf, filename.c_str(), count_rm_file);
+        if (unlink(filename.c_str()) != 0 && errno != ENOENT) {
+          return PosixError(filename, errno);
+        }
+      } else {
+        // Both the symlink and the real file exist
+        fprintf(stdout, "[log %s] remove [%s] --> [%s] file number %d\n", 
+                time_buf, filename.c_str(), real_name, count_rm_file);
+        
+        // Try to remove the real file first
+        if (unlink(real_name) != 0 && errno != ENOENT) {
+          return PosixError(filename, errno);
+        }
+        
+        // Then remove the symlink
+        if (unlink(filename.c_str()) != 0 && errno != ENOENT) {
+          return PosixError(filename, errno);
+        }
+      }
     }
+    
     return Status::OK();
   }
 
@@ -630,6 +803,11 @@ class PosixEnv : public Env {
   }
 
   Status RemoveDir(const std::string& dirname) override {
+    time ( &rawtime );
+    timeinfo = localtime ( &rawtime );
+    strftime(time_buf, 30, "%x %X", timeinfo);
+    fprintf(stdout, "[log %s] remove DIR!!!!!! (%s)\n", time_buf, dirname.c_str());
+
     if (::rmdir(dirname.c_str()) != 0) {
       return PosixError(dirname, errno);
     }
@@ -647,6 +825,11 @@ class PosixEnv : public Env {
   }
 
   Status RenameFile(const std::string& from, const std::string& to) override {
+    time ( &rawtime );
+    timeinfo = localtime ( &rawtime );
+    strftime(time_buf, 30, "%x %X", timeinfo);
+    fprintf(stdout, "[log %s] RENAME FILE!!!!!! %s -> %s\n", time_buf, from.c_str(), to.c_str());
+
     if (std::rename(from.c_str(), to.c_str()) != 0) {
       return PosixError(from, errno);
     }

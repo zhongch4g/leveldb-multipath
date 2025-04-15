@@ -35,7 +35,13 @@
 #include "util/logging.h"
 #include "util/mutexlock.h"
 
+#include <sys/time.h>
+
 namespace leveldb {
+
+static char time_buf[30];
+static time_t rawtime;
+static struct tm * timeinfo;
 
 const int kNumNonTableCacheFiles = 10;
 
@@ -820,7 +826,23 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
 
   // Make the output file
   std::string fname = TableFileName(dbname_, file_number);
-  Status s = env_->NewWritableFile(fname, &compact->outfile);
+
+  Status s;
+  std::string ldb_fmt = "ldb";
+  std::string name_fmt = fname.substr(fname.size() - 3);
+  time ( &rawtime );
+  timeinfo = localtime ( &rawtime );
+  strftime(time_buf, 30, "%x %X", timeinfo);
+  if (!(name_fmt == ldb_fmt)) {
+    s = env_->NewWritableFile(fname, &compact->outfile);
+    fprintf(stdout, "[log %s] Compaction Create: %s\n", time_buf, fname.c_str());
+  } else {
+    fprintf(stdout, "[log %s] Compaction Create: %s level-[%d]\n", time_buf, fname.c_str(), compact->compaction->level() + 1);
+    std::string level_str = std::to_string(compact->compaction->level() + 1);
+    std::string fname_used_to_create = fname.substr(0,fname.size()-4) + "START" + level_str + "END.ldb";
+    s = env_->NewWritableFile(fname_used_to_create, &compact->outfile);
+  }
+
   if (s.ok()) {
     compact->builder = new TableBuilder(options_, compact->outfile);
   }
